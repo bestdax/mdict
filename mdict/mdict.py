@@ -207,7 +207,15 @@ class Mdict:
 
     def _split_key_block(self, key_block: bytes) -> list:
         """
-        将压缩的键区块分割成键列表。
+        将输入的字符串按照指定的分隔符分割成多个块。
+
+        该函数接收key_block的字节流作为输入，并返回一个(key_id, key_text)的列表。
+
+        参数：
+            key_block (bytes): 需要被分割成块的bytes。
+
+        返回：
+            list: (key_id: int, key_text: bytes)的列表。
         """
         key_list = []
         key_start_index = 0
