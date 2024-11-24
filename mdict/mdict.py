@@ -8,6 +8,7 @@ import zlib
 import re
 import html
 from io import BytesIO
+import lzo
 
 
 class Mdict:
@@ -18,11 +19,12 @@ class Mdict:
         Args:
             mdx_path (str): MDX文件的路径。
         """
-        self.mdx_path = mdx_path
-        self.header_bites_size = 0
-        self.header_bites = None
-        self.key_block_offset = 0
-        self.stylesheet = {}
+        self._mdx_path = mdx_path
+        self._header_bytes_size = 0
+        self._header_bytes = None
+        self._key_block_offset = 0
+        self._key_block_offset = 0
+        self._stylesheet = {}
         self._mdx_file = None
         self._encoding = None
 
@@ -46,24 +48,24 @@ class Mdict:
             IOError: 文件读取错误。
         """
         try:
-            with open(self.mdx_path, 'rb') as mdict_file:
+            with open(self._mdx_path, 'rb') as mdict_file:
                 # 文件头信息提取
-                self.header_bites_size = unpack('>I', mdict_file.read(4))[0]  # 开始的4个字节存储文件头信息的长度
-                self.header_bites = mdict_file.read(self.header_bites_size)  # 读取文件头比特流
+                self._header_bytes_size = unpack('>I', mdict_file.read(4))[0]  # 开始的4个字节存储文件头信息的长度
+                self._header_bytes = mdict_file.read(self._header_bytes_size)  # 读取文件头比特流
 
                 # adler32数据校验
                 adler32 = unpack('<I', mdict_file.read(4))[0]  # 以小端数存储的4位校验码
-                assert adler32 == zlib.adler32(self.header_bites) & 0xffffffff
+                assert adler32 == zlib.adler32(self._header_bytes) & 0xffffffff
 
                 # 记录键开始的位置
-                self.key_block_offset = mdict_file.tell()
+                self._key_block_offset = mdict_file.tell()
         except FileNotFoundError:
-            print(f"File {self.mdx_path} not found.")
+            print(f"File {self._mdx_path} not found.")
         except IOError as e:
-            print(f"Error reading file {self.mdx_path}: {e}")
+            print(f"Error reading file {self._mdx_path}: {e}")
 
         # 文件头信息的最后\x00\x00需要舍弃，内容是用utf-16编码的，需要解码，然后再转成utf-8编码
-        header_text = str(self.header_bites[:-2].decode('utf-16').encode('utf-8'))
+        header_text = str(self._header_bytes[:-2].decode('utf-16').encode('utf-8'))
 
         # 提取tag信息并转换成字典，同时将信息逆转义 (将&lt;替换成<，将&gt;替换成>等)
         tag_list = re.findall(r'(\w+)="(.*?)"', header_text, re.DOTALL)
@@ -109,7 +111,7 @@ class Mdict:
         if self._tag_dict.get('Stylesheet') is not None:
             lines = self._tag_dict['Stylesheet'].split()
             for row in range(0, len(lines), 3):
-                self.stylesheet[lines[row]] = lines[row + 1:row + 3]
+                self._stylesheet[lines[row]] = lines[row + 1:row + 3]
 
         # 版本2.0之前数字的宽度是4个字节，>=2.0的版本是8个字节
         self._version = float(self._tag_dict['GeneratedByEngineVersion'])
@@ -120,9 +122,9 @@ class Mdict:
             self._number_width = 8
             self._number_format = '>Q'
 
-    def _read_mdx_keys(self) -> None:
-        with open(self.mdx_path, 'rb') as mdict_file:
-            mdict_file.seek(self.key_block_offset)
+    def _read_mdx_keys(self) -> list:
+        with open(self._mdx_path, 'rb') as mdict_file:
+            mdict_file.seek(self._key_block_offset)
 
             if self._version < 2.0:
                 number_bytes = self._number_width * 4
@@ -140,7 +142,7 @@ class Mdict:
             # 读取键区块的数量
             number_of_key_blocks = self._read_number(bytes_stream)
             # 读取词条的数量
-            self.number_of_entries = self._read_number(bytes_stream)
+            self._number_of_entries = self._read_number(bytes_stream)
             # 在2.0版本及之后，block的第三段存储键区块信息解压后的字节数
             if self._version >= 2.0:
                 key_block_info_decompressed_size = self._read_number(bytes_stream)
@@ -155,9 +157,90 @@ class Mdict:
                 assert adler32 == zlib.adler32(block) & 0xffffffff
 
             key_block_info = mdict_file.read(key_block_info_compressed_size)
-            self._decode_key_block_info(key_block_info)
+            key_block_info_list = self._decode_key_block_info(key_block_info)
+            assert len(key_block_info_list) == number_of_key_blocks
 
-    def _decode_key_block_info(self, key_block_info_compressed: bytes) -> None:
+            # 读取键区块
+            key_block_compressed = mdict_file.read(key_block_size)
+            key_list = self._decode_key_block(key_block_compressed, key_block_info_list)
+
+            self._key_block = mdict_file.tell()
+
+        return key_list
+
+    def _decode_key_block(self, key_block_compressed: bytes, key_block_info_list: list) -> list:
+        """
+        解码压缩的键区块。
+        """
+        key_list = []
+        key_offset = 0
+        key_block = b''
+
+        for compressed_size, decompressed_size in key_block_info_list:
+            start = key_offset
+            end = start + compressed_size
+
+            # 最开始的4个字节为压缩类型
+            key_block_type = key_block_compressed[start: start + 4]
+            # 第二个4个字节为adler32校验码
+            adler32 = unpack('>I', key_block_compressed[start + 4:start + 8])[0]
+
+            if key_block_type == b'\x00\x00\x00\x00':
+                key_block = key_block_compressed[start + 8:end]
+            elif key_block_type == b'\x01\x00\x00\x00':
+                key_block = lzo.decompress(key_block_compressed[start + 8:end])
+            elif key_block_type == b'\x02\x00\x00\x00':
+                try:
+                    key_block = zlib.decompress(key_block_compressed[start + 8:end])
+                except zlib.error as e:
+                    print(f'压缩数据解压失败: {e}')
+            else:
+                raise NotImplementedError('不支持该压缩类型')
+
+            key_list.extend(self._split_key_block(key_block))
+
+            assert adler32 == zlib.adler32(key_block) & 0xffffffff
+
+            key_offset += compressed_size
+
+        return key_list
+
+    def _split_key_block(self, key_block: bytes) -> list:
+        """
+        将压缩的键区块分割成键列表。
+        """
+        key_list = []
+        key_start_index = 0
+
+        while key_start_index < len(key_block):
+            temp = key_block[key_start_index:key_start_index + self._number_width]
+            key_id = unpack(self._number_format, temp)[0]
+
+            # 键值文本以\x00结尾
+            if self._encoding == 'UTF-16':
+                delimiter = b'\x00\x00'
+                width = 2
+            else:
+                delimiter = b'\x00'
+                width = 1
+
+            i = key_start_index + self._number_width
+
+            key_end_index = 0
+            while i < len(key_block):
+                if key_block[i: i + width] == delimiter:
+                    key_end_index = i
+                    break
+                i += width
+            if key_end_index:
+                key_text = key_block[key_start_index + self._number_width:key_end_index] \
+                    .decode(self._encoding, errors='ignore').encode('utf-8').strip()
+                key_start_index = key_end_index + width
+                key_list += [(key_id, key_text)]
+
+        return key_list
+
+    def _decode_key_block_info(self, key_block_info_compressed: bytes) -> list:
         """
         解码压缩的键区块信息。
 
@@ -203,44 +286,48 @@ class Mdict:
             byte_width = 1
             text_term = 0
 
-        key_index = 0
+        key_offset = 0
 
-        while key_index < len(key_block_info):
+        while key_offset < len(key_block_info):
             # 当前区块中的词条数量
-            number_of_entries = unpack(self._number_format, key_block_info[key_index:key_index + self._number_width])[0]
-            key_index += self._number_width
+            number_of_entries += \
+                unpack(self._number_format, key_block_info[key_offset:key_offset + self._number_width])[
+                    0]
+            key_offset += self._number_width
 
             # 文本头部长度
-            text_head_size = unpack(byte_format, key_block_info[key_index:key_index + byte_width])[0]
-            key_index += byte_width
+            text_head_size = unpack(byte_format, key_block_info[key_offset:key_offset + byte_width])[0]
+            key_offset += byte_width
 
             # 文本头部
             if self._encoding != 'UTF-16':
-                key_index += text_head_size + text_term
+                key_offset += text_head_size + text_term
             else:
-                key_index += (text_head_size + text_term) * 2
+                key_offset += (text_head_size + text_term) * 2
 
             # 文本尾部长度
-            text_tail_size = unpack(byte_format, key_block_info[key_index:key_index + byte_width])[0]
-            key_index += byte_width
+            text_tail_size = unpack(byte_format, key_block_info[key_offset:key_offset + byte_width])[0]
+            key_offset += byte_width
 
             # 文本尾部
             if self._encoding != 'UTF-16':
-                key_index += text_tail_size + text_term
+                key_offset += text_tail_size + text_term
             else:
-                key_index += (text_tail_size + text_term) * 2
+                key_offset += (text_tail_size + text_term) * 2
 
             # 键区块的压缩后的字节数
             key_block_compressed_size = \
-                unpack(self._number_format, key_block_info[key_index:key_index + self._number_width])[0]
-            key_index += self._number_width
+                unpack(self._number_format, key_block_info[key_offset:key_offset + self._number_width])[0]
+            key_offset += self._number_width
 
             # 键区块的解压后的字节数
             key_block_decompressed_size = \
-                unpack(self._number_format, key_block_info[key_index:key_index + self._number_width])[0]
-            key_index += self._number_width
+                unpack(self._number_format, key_block_info[key_offset:key_offset + self._number_width])[0]
+            key_offset += self._number_width
             key_block_info_list.append((key_block_compressed_size, key_block_decompressed_size))
-        print(key_block_info_list)
+
+        assert number_of_entries == self._number_of_entries
+        return key_block_info_list
 
 
 if __name__ == '__main__':
